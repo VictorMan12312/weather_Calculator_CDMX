@@ -30,7 +30,7 @@ def obtener_historial(start, end):
         "longitude": LON,
         "start_date": start.strftime("%Y-%m-%d"),
         "end_date": end.strftime("%Y-%m-%d"),
-        "hourly": "temperature_2m",
+        "hourly": "temperature_2m,relative_humidity_2m,surface_pressure,cloudcover",
         "timezone": TIMEZONE
     }
 
@@ -43,13 +43,19 @@ def obtener_historial(start, end):
 
     df = pd.DataFrame({
         "time": data["hourly"]["time"],
-        "temp": data["hourly"]["temperature_2m"]
+        "temp": data["hourly"]["temperature_2m"],
+        "humidity": data["hourly"]["relative_humidity_2m"],
+        "pressure": data["hourly"]["surface_pressure"],
+        "clouds": data["hourly"]["cloudcover"]
     })
 
     df["time"] = pd.to_datetime(df["time"])
     df.set_index("time", inplace=True)
     df = df.resample("h").mean()
-    df["temp"] = df["temp"].interpolate()
+    
+    # Interpolamos todas las columnas para que no haya huecos
+    for col in df.columns:
+        df[col] = df[col].interpolate()
 
     return df
 
@@ -67,13 +73,27 @@ def extraer_features(df):
     df['sin_doy'] = np.sin(2 * np.pi * dias / 365.25)
     df['cos_doy'] = np.cos(2 * np.pi * dias / 365.25)
 
-    # Lags
+    # Lags de temperatura
     for lag in [1, 2, 3, 6, 12, 24, 48]:
         df[f'lag_{lag}'] = df['temp'].shift(lag)
 
+    # Lags de variables auxiliares (lo que pasó hace 1-6 horas)
+    for col in ['humidity', 'pressure', 'clouds']:
+        if col in df.columns:
+            df[f'{col}_lag_1'] = df[col].shift(1)
+            df[f'{col}_lag_6'] = df[col].shift(6)
     
     df['roll_6'] = df['temp'].shift(1).rolling(6).mean()
     df['roll_24'] = df['temp'].shift(1).rolling(24).mean()
+
+        # Mínimo y Máximo del día anterior 
+    df['roll_24_min'] = df['temp'].shift(1).rolling(24).min()
+    df['roll_24_max'] = df['temp'].shift(1).rolling(24).max()
+    df['roll_24_std'] = df['temp'].shift(1).rolling(24).std() # cambio critico que hubo en el dia
+
+    # Diferencias entre el dia anterior y el actual
+    df['diff_24h'] = df['temp'].shift(1) - df['temp'].shift(25) # Diferencia con la misma hora
+    df['diff_1h'] = df['temp'].shift(1) - df['temp'].shift(2)
 
     return df
 
@@ -108,7 +128,8 @@ def entrenar_modelo():
     params = {
         'objective': 'regression',
         'metric': 'mae',
-        'learning_rate': 0.05,
+        'learning_rate': 0.01,
+        'feature_fraction': 0.8,
         'num_leaves': 31,
         'verbosity': -1
     }
@@ -119,7 +140,7 @@ def entrenar_modelo():
         params,
         dtrain,
         valid_sets=[dval],
-        num_boost_round=500,
+        num_boost_round=1500,
         callbacks=[lgb.early_stopping(50)]
     )
 
@@ -154,33 +175,44 @@ def predecir_futuro(fecha_objetivo):
 
     model = joblib.load(MODEL_FILE)
 
-    # Contexto reciente
-    df = obtener_historial(now - timedelta(days=7), now)
+    # 1. Obtener historial reciente para los lags
+    df_hist = obtener_historial(now - timedelta(days=7), now)
+    
+    # 2. Obtener PRONÓSTICO de variables auxiliares (humedad, presión, nubes)
+    # Esto es necesario para que el modelo "sepa" cómo estará el entorno en el futuro
+    url_forecast = "https://api.open-meteo.com/v1/forecast"
+    params_f = {
+        "latitude": LAT, "longitude": LON, "timezone": TIMEZONE,
+        "hourly": "relative_humidity_2m,surface_pressure,cloudcover"
+    }
+    resp_f = requests.get(url_forecast, params=params_f).json()
+    
+    df_fore = pd.DataFrame({
+        "time": pd.to_datetime(resp_f["hourly"]["time"]),
+        "humidity": resp_f["hourly"]["relative_humidity_2m"],
+        "pressure": resp_f["hourly"]["surface_pressure"],
+        "clouds": resp_f["hourly"]["cloudcover"],
+        "temp": np.nan # La temperatura es lo que vamos a predecir
+    }).set_index("time")
 
-    history = df[['temp']].copy()
+    # Combinamos historial con el hueco del futuro
+    history = pd.concat([df_hist, df_fore[df_fore.index > df_hist.index.max()]])
 
     for i in range(1, horas + 1):
         next_dt = now + timedelta(hours=i)
-
-        # Se agrega fila futura vacía
-        history.loc[next_dt] = np.nan
-
         
+        if next_dt not in history.index: continue
+
+        # Generamos características usando los datos de atmósfera que ya tenemos del pronóstico
         feat = extraer_features(history)
-
         X_next = feat.loc[[next_dt]].drop(columns=['temp'])
-
+        
         pred = model.predict(X_next)[0]
-
         history.loc[next_dt, 'temp'] = pred
 
-    if fecha_objetivo not in history.index or pd.isna(history.loc[fecha_objetivo, 'temp']):
-        if fecha_objetivo not in history.index:
-            history.loc[fecha_objetivo] = np.nan
-        feat = extraer_features(history)
-        if fecha_objetivo in feat.index:
-            X_obj = feat.loc[[fecha_objetivo]].drop(columns=['temp'])
-            history.loc[fecha_objetivo, 'temp'] = model.predict(X_obj)[0]
+    if fecha_objetivo not in history.index:
+        print("Fecha fuera de rango de pronóstico.")
+        return
 
     resultado = history.loc[fecha_objetivo, 'temp']
 
